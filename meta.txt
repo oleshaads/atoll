@@ -1,0 +1,6 @@
+run: 40318897839
+cmd: Set-Location C:\Users\artol\atoll
+git pull -q 2>&1 | Out-String
+Set-Location tools\agent-console
+'файлы: ' + ((Get-ChildItem -Name) -join ', ')
+& 'C:\Users\artol\atoll\.venv\Scripts\python.exe' -c "import ast,sys; ast.parse(open('app.py',encoding='utf-8').read()); print('app.py синтаксис ok')"
