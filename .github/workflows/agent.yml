@@ -1,5 +1,5 @@
 name: agent-bridge
-run-name: "${{ inputs.cmd }}"
+run-name: "${{ github.event.client_payload.cmd || inputs.cmd }}"
 
 on:
   workflow_dispatch:
@@ -8,6 +8,8 @@ on:
         description: "Команда PowerShell"
         required: true
         type: string
+  repository_dispatch:
+    types: [agent]
 
 permissions: {}
 
@@ -17,15 +19,16 @@ concurrency:
 
 jobs:
   exec:
-    # Задачу может запускать только владелец репозитория.
-    if: github.actor == github.repository_owner
+    # repository_dispatch может отправить только тот, у кого есть write-доступ;
+    # ручной запуск — только владелец репозитория.
+    if: github.event_name == 'repository_dispatch' || github.actor == github.repository_owner
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 20
     steps:
       - name: Run
         shell: powershell
         env:
-          CMD: ${{ inputs.cmd }}
+          CMD: ${{ github.event.client_payload.cmd || inputs.cmd }}
         run: |
           Write-Output ">>> $env:CMD"
           Write-Output "host: $env:COMPUTERNAME | user: $env:USERNAME | cwd: $(Get-Location)"
