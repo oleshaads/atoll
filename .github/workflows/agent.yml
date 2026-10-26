@@ -11,7 +11,8 @@ on:
   repository_dispatch:
     types: [agent]
 
-permissions: {}
+permissions:
+  contents: write
 
 concurrency:
   group: agent-bridge
@@ -19,7 +20,7 @@ concurrency:
 
 jobs:
   exec:
-    # repository_dispatch может отправить только тот, у кого есть write-доступ;
+    # repository_dispatch отправляет только тот, у кого есть write-доступ;
     # ручной запуск — только владелец репозитория.
     if: github.event_name == 'repository_dispatch' || github.actor == github.repository_owner
     runs-on: [self-hosted, Windows, X64]
@@ -31,14 +32,26 @@ jobs:
           CMD: ${{ github.event.client_payload.cmd || inputs.cmd }}
         run: |
           Write-Output ">>> $env:CMD"
-          Write-Output "host: $env:COMPUTERNAME | user: $env:USERNAME | cwd: $(Get-Location)"
-          Invoke-Expression $env:CMD *>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\out.txt"
+          Write-Output "host: $env:COMPUTERNAME | user: $env:USERNAME"
+          $code = 0
+          try { Invoke-Expression $env:CMD *>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\out.txt" } catch { $_ | Out-String | Tee-Object -FilePath "$env:RUNNER_TEMP\out.txt" -Append; $code = 1 }
+          exit $code
 
-      - name: Save output
+      # Вывод складывается в ветку bridge-out, чтобы его можно было прочитать извне.
+      - name: Publish output
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: out
-          path: ${{ runner.temp }}/out.txt
-          if-no-files-found: ignore
-          retention-days: 3
+        shell: powershell
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "out.txt"
+          if (-not (Test-Path $out)) { "no output" | Set-Content $out }
+          $d = Join-Path $env:RUNNER_TEMP "publish"
+          New-Item -ItemType Directory -Force $d | Out-Null
+          Copy-Item $out (Join-Path $d "out.txt") -Force
+          "run: $env:GITHUB_RUN_ID`ncmd: $env:CMD" | Set-Content (Join-Path $d "meta.txt")
+          Set-Location $d
+          git init -q -b bridge-out | Out-Null
+          git add -A
+          git -c user.name="agent-bridge" -c user.email="agent-bridge@users.noreply.github.com" commit -qm "out $env:GITHUB_RUN_ID" | Out-Null
+          git push -f "https://x-access-token:$env:TOKEN@github.com/$env:GITHUB_REPOSITORY.git" bridge-out 2>&1 | Out-String | Write-Output
