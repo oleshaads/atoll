@@ -45,6 +45,7 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CMD: ${{ github.event.client_payload.cmd || inputs.cmd }}
         run: |
+          $ErrorActionPreference = "Continue"
           $out = Join-Path $env:RUNNER_TEMP "out.txt"
           if (-not (Test-Path $out)) { "no output" | Set-Content $out }
           $d = Join-Path $env:RUNNER_TEMP "publish"
@@ -55,5 +56,5 @@ jobs:
           git init -q -b bridge-out | Out-Null
           git add -A
           git -c user.name="agent-bridge" -c user.email="agent-bridge@users.noreply.github.com" commit -qm "out $env:GITHUB_RUN_ID" | Out-Null
-          git push -f "https://x-access-token:$env:TOKEN@github.com/$env:GITHUB_REPOSITORY.git" bridge-out 2>&1 | Out-String | Write-Output
-          exit 0
+          git push -q -f "https://x-access-token:$env:TOKEN@github.com/$env:GITHUB_REPOSITORY.git" bridge-out 2>&1 | ForEach-Object { "$_" }
+          Write-Output "publish done"
