@@ -221,6 +221,19 @@ async function writeChat(name, payload, attempt = 1){
   }
 }
 
+async function agentPresence(){
+  try {
+    const res = await fetch(API + '/repos/' + OWNER_REPO + '/contents/presence.json?ref=' + BRANCH, {
+      headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github.raw' }
+    });
+    if (!res.ok) return false;
+    const data = JSON.parse(await res.text());
+    if (!data.online || !data.ts) return false;
+    const age = (Date.now() - Date.parse(data.ts)) / 1000;
+    return age < 180;
+  } catch(e){ return false; }
+}
+
 async function poll(){
   if (!token || polling || !navigator.onLine) { setTimeout(poll, POLL_MS); return; }
   polling = true;
@@ -235,9 +248,15 @@ async function poll(){
       lastName = names[names.length - 1];
       localStorage.setItem(STORE_LAST, lastName);
     }
-    dot.className = 'dot on';
-    stateEl.textContent = names.length + ' сообщений · онлайн';
+    const agentOnline = await agentPresence();
+    dot.className = 'dot ' + (agentOnline ? 'on' : 'off');
+    stateEl.textContent = names.length + ' сообщений · ' + (agentOnline ? 'агент на связи' : 'агент офлайн');
     if (banner.classList.contains('err')) hideBanner();
+    if (!agentOnline && !banner.classList.contains('err')){
+      showBanner('Агент сейчас не читает канал: сообщение сохранится и попадёт к нему, как только сессия возобновится.', 'info');
+    } else if (agentOnline && banner.classList.contains('info')) {
+      hideBanner();
+    }
   } catch(e){
     dot.className = 'dot off';
     stateEl.textContent = 'нет связи с GitHub';
