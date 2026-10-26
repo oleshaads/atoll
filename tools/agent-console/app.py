@@ -148,6 +148,16 @@ def install_gh() -> bool:
     return bool(shutil.which("gh"))
 
 
+def login_with_token(token: str) -> str:
+    proc = subprocess.run(
+        ["gh", "auth", "login", "--hostname", "github.com", "--with-token"],
+        input=token.encode("utf-8"), capture_output=True, timeout=60,
+    )
+    if proc.returncode != 0:
+        raise GhError("токен не подошёл: " + (proc.stderr or b"").decode("utf-8", "replace").strip())
+    return gh("api", "user", "--jq", ".login").strip()
+
+
 def ensure_auth(interactive: bool = True) -> str:
     """Возвращает login пользователя, при необходимости проводит вход."""
     try:
@@ -444,8 +454,17 @@ def main() -> int:
     refresh_path()
     if not shutil.which("gh") and not install_gh():
         return 2
+
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if "--token" in sys.argv:
+        idx = sys.argv.index("--token")
+        if idx + 1 < len(sys.argv):
+            token = sys.argv[idx + 1]
     try:
-        login = ensure_auth(interactive=True)
+        if token:
+            login = login_with_token(token)
+        else:
+            login = ensure_auth(interactive=True)
     except GhError as exc:
         say(Panel(Text(str(exc), style="red"), border_style="red", title="GitHub"))
         return 2
