@@ -87,6 +87,7 @@
       <li><b>Repository access</b> → Only select repositories → <code class="k">atoll</code></li>
       <li><b>Permissions</b> → Contents: <b>Read and write</b></li>
       <li>Срок действия — любой, например 90 дней</li>
+      <li><b>Contents</b> должен быть <b>Read and write</b>, иначе отправка вернёт ошибку 403</li>
       <li>Generate token и вставь сюда</li>
     </ol>
     <input id="tokenInput" type="password" placeholder="github_pat_… или ghp_…" autocomplete="off">
@@ -285,7 +286,19 @@ el('f').addEventListener('submit', async (e) => {
     input.value = ''; input.style.height = '46px';
     await poll();
   } catch(err){
-    showBanner('Не отправлено: ' + err.message, 'err');
+    const msg = String(err.message || err);
+    if (msg.includes('403')){
+      showBanner(
+        'Токен не может писать в репозиторий (403).\n\n' +
+        'Что сделать: открой токен и дай право Contents: Read and write —\n' +
+        'https://github.com/settings/personal-access-tokens\n\n' +
+        'Либо создай новый токен по этой ссылке:\n' +
+        'https://github.com/settings/personal-access-tokens/new?name=atoll-chat&target_name=oleshaads\n' +
+        'Repository access → Only select repositories → atoll\n' +
+        'Permissions → Contents → Read and write', 'err');
+    } else {
+      showBanner('Не отправлено: ' + msg, 'err');
+    }
   } finally {
     sendBtn.disabled = false; sendBtn.textContent = 'отправить'; input.focus();
   }
