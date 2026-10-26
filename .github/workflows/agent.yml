@@ -20,8 +20,6 @@ concurrency:
 
 jobs:
   exec:
-    # repository_dispatch отправляет только тот, у кого есть write-доступ;
-    # ручной запуск — только владелец репозитория.
     if: github.event_name == 'repository_dispatch' || github.actor == github.repository_owner
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 20
@@ -31,13 +29,41 @@ jobs:
         env:
           CMD: ${{ github.event.client_payload.cmd || inputs.cmd }}
         run: |
+          $ErrorActionPreference = "Continue"
+          $pub = Join-Path $env:RUNNER_TEMP "publish"
+          New-Item -ItemType Directory -Force $pub | Out-Null
+
+          # --- помощники, доступные команде агента ---
+          function Publish-File {
+            param([string]$Path)
+            Copy-Item -LiteralPath $Path -Destination $pub -Force
+            Write-Output ("published: " + (Split-Path $Path -Leaf))
+          }
+          function Shot {
+            param([string]$Name = "shot.png")
+            Add-Type -AssemblyName System.Windows.Forms
+            Add-Type -AssemblyName System.Drawing
+            $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+            $path = Join-Path $pub $Name
+            $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $bmp.Dispose()
+            Write-Output ("screenshot: " + $path + " (" + [math]::Round((Get-Item $path).Length / 1KB, 1) + " KB)")
+          }
+
           Write-Output ">>> $env:CMD"
           Write-Output "host: $env:COMPUTERNAME | user: $env:USERNAME"
           $code = 0
-          try { Invoke-Expression $env:CMD *>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\out.txt" } catch { $_ | Out-String | Tee-Object -FilePath "$env:RUNNER_TEMP\out.txt" -Append; $code = 1 }
+          try {
+            Invoke-Expression $env:CMD *>&1 | Tee-Object -FilePath "$pub\out.txt"
+          } catch {
+            $_ | Out-String | Tee-Object -FilePath "$pub\out.txt" -Append
+            $code = 1
+          }
           exit $code
 
-      # Вывод складывается в ветку bridge-out, чтобы его можно было прочитать извне.
       - name: Publish output
         if: always()
         shell: powershell
@@ -46,12 +72,13 @@ jobs:
           CMD: ${{ github.event.client_payload.cmd || inputs.cmd }}
         run: |
           $ErrorActionPreference = "Continue"
-          $out = Join-Path $env:RUNNER_TEMP "out.txt"
-          if (-not (Test-Path $out)) { "no output" | Set-Content $out }
-          $d = Join-Path $env:RUNNER_TEMP "publish"
+          $pub = Join-Path $env:RUNNER_TEMP "publish"
+          New-Item -ItemType Directory -Force $pub | Out-Null
+          if (-not (Test-Path (Join-Path $pub "out.txt"))) { "no output" | Set-Content (Join-Path $pub "out.txt") }
+          "run: $env:GITHUB_RUN_ID`ncmd: $env:CMD" | Set-Content (Join-Path $pub "meta.txt")
+          $d = Join-Path $env:RUNNER_TEMP "publish-git"
           New-Item -ItemType Directory -Force $d | Out-Null
-          Copy-Item $out (Join-Path $d "out.txt") -Force
-          "run: $env:GITHUB_RUN_ID`ncmd: $env:CMD" | Set-Content (Join-Path $d "meta.txt")
+          Copy-Item (Join-Path $pub "*") $d -Force -Recurse
           Set-Location $d
           git init -q -b bridge-out | Out-Null
           git add -A
