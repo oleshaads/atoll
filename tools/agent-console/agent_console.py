@@ -395,6 +395,27 @@ class OpenAIProvider(Provider):
             yield ("tool_calls", calls)
 
 
+class GitHubModelsProvider(OpenAIProvider):
+    """Бесплатные модели GitHub Models (токен берётся из gh auth token)."""
+
+    name = "github"
+
+    def __init__(self, model: str, api_key: str | None = None, base_url: str | None = None, max_tokens: int = 4096):
+        token = api_key or os.environ.get("GITHUB_TOKEN") or _gh_token()
+        if not token:
+            raise ProviderError("Нужен токен GitHub: выполни gh auth login или задай GITHUB_TOKEN")
+        super().__init__(model, token, base_url or "https://models.github.ai/inference", max_tokens)
+
+
+def _gh_token() -> str | None:
+    try:
+        proc = subprocess.run(["gh", "auth", "token"], capture_output=True, timeout=30)
+        token = proc.stdout.decode("utf-8", "replace").strip()
+        return token or None
+    except Exception:
+        return None
+
+
 class OllamaProvider(Provider):
     name = "ollama"
 
@@ -475,6 +496,61 @@ class FakeProvider(Provider):
             yield ("text", "**Готово.** Инструмент выполнен, цикл агента работает.")
 
 
+def ollama_ready(base_url: str) -> bool:
+    try:
+        with urllib.request.urlopen(base_url.rstrip("/") + "/api/tags", timeout=3) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def ollama_models(base_url: str) -> list[str]:
+    try:
+        with urllib.request.urlopen(base_url.rstrip("/") + "/api/tags", timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        return [m.get("name", "") for m in data.get("models", [])]
+    except Exception:
+        return []
+
+
+def ensure_ollama(console: Console, base_url: str, model: str) -> None:
+    """Поднять сервер Ollama при необходимости и скачать модель, если её нет."""
+    if not ollama_ready(base_url):
+        console.print(Text("запускаю Ollama…", style="dim"))
+        exe = shutil.which("ollama")
+        if exe:
+            kwargs = {}
+            if os.name == "nt":
+                kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.Popen([exe, "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+        for _ in range(30):
+            if ollama_ready(base_url):
+                break
+            time.sleep(1)
+        if not ollama_ready(base_url):
+            console.print(Panel(
+                Text("Ollama не отвечает. Установи: winget install Ollama.Ollama\n"
+                     "Или выбери другой мозг: /provider github"),
+                border_style="yellow", title="нет локальной модели", title_align="left",
+            ))
+            return
+    have = ollama_models(base_url)
+    short = model.split(":")[0]
+    if any(m == model or m.startswith(short) for m in have):
+        return
+    console.print(Text(f"модели {model} нет — качаю один раз, потом работает офлайн…", style="yellow"))
+    exe = shutil.which("ollama")
+    if not exe:
+        console.print(Text("не нашёл команду ollama", style="red"))
+        return
+    with console.status(f"ollama pull {model}", spinner="dots"):
+        proc = subprocess.run([exe, "pull", model], capture_output=True, timeout=7200)
+    if proc.returncode != 0:
+        console.print(Text((proc.stderr or b"").decode("utf-8", "replace")[:400], style="red"))
+    else:
+        console.print(Text(f"модель {model} готова", style="green"))
+
+
 def make_provider(cfg: dict[str, Any]) -> Provider:
     kind = cfg.get("provider", "ollama")
     kwargs = {
@@ -489,6 +565,8 @@ def make_provider(cfg: dict[str, Any]) -> Provider:
         return AnthropicProvider(**kwargs)
     if kind == "openai":
         return OpenAIProvider(**kwargs)
+    if kind == "github":
+        return GitHubModelsProvider(**kwargs)
     return OllamaProvider(**kwargs)
 
 
@@ -986,7 +1064,7 @@ def handle_slash(console: Console, session: Session, cfg: dict[str, Any], line: 
             console.print(Text(f"текущая модель: {session.model}", style="dim"))
         return True, provider
     if cmd == "/provider":
-        if arg in ("ollama", "anthropic", "openai"):
+        if arg in ("ollama", "anthropic", "openai", "github"):
             cfg["provider"] = arg
             save_config(cfg)
             try:
@@ -997,7 +1075,7 @@ def handle_slash(console: Console, session: Session, cfg: dict[str, Any], line: 
             except ProviderError as exc:
                 console.print(Text(str(exc), style="red"))
         else:
-            console.print(Text("используй: /provider ollama|anthropic|openai", style="yellow"))
+            console.print(Text("используй: /provider ollama|github|anthropic|openai", style="yellow"))
         return True, provider
     if cmd == "/cd":
         target = Path(arg).expanduser() if arg else Path.home()
@@ -1026,6 +1104,8 @@ def handle_slash(console: Console, session: Session, cfg: dict[str, Any], line: 
 
 
 def interactive(console: Console, session: Session, cfg: dict[str, Any]) -> None:
+    if cfg.get("provider", "ollama") == "ollama":
+        ensure_ollama(console, cfg.get("base_url") or "http://localhost:11434", cfg.get("model") or DEFAULT_CONFIG["model"])
     provider = make_provider(cfg)
     banner(console, cfg, session.cwd)
     while True:
@@ -1057,6 +1137,8 @@ def interactive(console: Console, session: Session, cfg: dict[str, Any]) -> None
 
 
 def run_print(console: Console, session: Session, cfg: dict[str, Any], prompt: str) -> int:
+    if cfg.get("provider", "ollama") == "ollama":
+        ensure_ollama(console, cfg.get("base_url") or "http://localhost:11434", cfg.get("model") or DEFAULT_CONFIG["model"])
     try:
         provider = make_provider(cfg)
     except ProviderError as exc:
@@ -1142,7 +1224,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("prompt", nargs="*", help="задача (если нужен разовый запуск)")
     parser.add_argument("-p", "--print", dest="print_mode", action="store_true", help="выполнить и выйти")
-    parser.add_argument("--provider", choices=["ollama", "anthropic", "openai", "fake"])
+    parser.add_argument("--provider", choices=["ollama", "github", "anthropic", "openai", "fake"])
     parser.add_argument("--model")
     parser.add_argument("--api-key")
     parser.add_argument("--base-url")
