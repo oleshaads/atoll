@@ -78,6 +78,23 @@ class GhError(RuntimeError):
     pass
 
 
+def auto_update() -> None:
+    """Подтянуть свежую версию приложения из репозитория, если это git-клон."""
+    root = APP_DIR
+    for parent in [root] + list(root.parents)[:4]:
+        if (parent / ".git").exists():
+            try:
+                before = (root / "app.py").read_bytes() if (root / "app.py").exists() else b""
+                subprocess.run(["git", "-C", str(parent), "pull", "--ff-only", "-q"],
+                               capture_output=True, timeout=90)
+                after = (root / "app.py").read_bytes() if (root / "app.py").exists() else b""
+                if before and after and before != after:
+                    say(Text("[update] приложение обновлено, перезапускаю…", style="yellow"))
+                    os.execv(sys.executable, [sys.executable, str(root / "app.py"), *sys.argv[1:]])
+            except Exception:
+                return
+
+
 def refresh_path() -> None:
     if os.name != "nt":
         return
@@ -112,26 +129,63 @@ def gh(*args: str, input_text: str | None = None, capture: bool = True, timeout:
     return out
 
 
-def api(path: str, method: str = "GET", fields: dict | None = None, raw: bool = False, allow_fail: bool = False) -> bytes | str:
-    args = ["api", "-X", method, path]
-    if raw:
-        args += ["-H", "Accept: application/vnd.github.raw"]
-    if fields:
-        for key, value in fields.items():
-            args += ["-f", f"{key}={value}"]
-    try:
-        if raw:
-            proc = subprocess.run(["gh", *args], capture_output=True, timeout=180)
-            if proc.returncode != 0:
-                if allow_fail:
-                    return b""
-                raise GhError((proc.stderr or b"").decode("utf-8", "replace").strip())
-            return proc.stdout
-        return gh(*args)
-    except (GhError, subprocess.TimeoutExpired) as exc:
-        if allow_fail:
-            return "" if not raw else b""
-        raise GhError(str(exc)) from exc
+TRANSIENT = ("502", "503", "504", "timeout", "Bad Gateway", "EOF", "connection reset")
+
+
+def _is_transient(text: str) -> bool:
+    low = text.lower()
+    return any(marker.lower() in low for marker in TRANSIENT)
+
+
+def api(
+    path: str,
+    method: str = "GET",
+    fields: dict | None = None,
+    raw: bool = False,
+    allow_fail: bool = False,
+    retries: int = 4,
+) -> bytes | str:
+    """Запрос к GitHub API с повторами при сбоях и понятными ошибками."""
+    last_error = ""
+    for attempt in range(retries):
+        try:
+            if fields is not None:
+                body = json.dumps(fields).encode("utf-8")
+                proc = subprocess.run(
+                    ["gh", "api", "-X", method, path, "--input", "-"],
+                    input=body, capture_output=True, timeout=180,
+                )
+                out = proc.stdout
+                err = (proc.stderr or b"").decode("utf-8", "replace").strip()
+                if proc.returncode == 0:
+                    return out.decode("utf-8", "replace")
+                last_error = err or f"код {proc.returncode}"
+            elif raw:
+                proc = subprocess.run(
+                    ["gh", "api", path, "-H", "Accept: application/vnd.github.raw"],
+                    capture_output=True, timeout=180,
+                )
+                if proc.returncode == 0:
+                    return proc.stdout
+                last_error = (proc.stderr or b"").decode("utf-8", "replace").strip()
+            else:
+                args = ["gh", "api", "-X", method, path]
+                proc = subprocess.run(args, capture_output=True, timeout=180)
+                if proc.returncode == 0:
+                    return proc.stdout.decode("utf-8", "replace")
+                last_error = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        except subprocess.TimeoutExpired:
+            last_error = "таймаут запроса"
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+
+        if attempt < retries - 1:
+            if not _is_transient(last_error):
+                break
+            time.sleep(2 ** attempt)
+    if allow_fail:
+        return b"" if raw else ""
+    raise GhError(last_error or "неизвестная ошибка GitHub")
 
 
 def install_gh() -> bool:
@@ -252,15 +306,29 @@ def read_chat(seq: int) -> dict | None:
 
 def write_chat(seq: int, payload: dict) -> None:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    api(
-        f"repos/{REPO}/contents/chat/{seq:06d}.json",
-        "PUT",
-        {
-            "message": f"chat {seq:06d} ({payload.get('from')})",
-            "content": base64.b64encode(body).decode("ascii"),
-            "branch": CHAT_BRANCH,
-        },
-    )
+    content_b64 = base64.b64encode(body).decode("ascii")
+    path = f"repos/{REPO}/contents/chat/{seq:06d}.json"
+    fields = {"message": f"chat {seq:06d} ({payload.get('from')})", "content": content_b64, "branch": CHAT_BRANCH}
+    # если файл уже существует — GitHub требует sha
+    existing = api(path + f"?ref={CHAT_BRANCH}", allow_fail=True)
+    if existing:
+        try:
+            fields["sha"] = json.loads(existing)["sha"]
+        except Exception:
+            pass
+    try:
+        api(path, "PUT", fields)
+    except GhError as exc:
+        if "already exists" in str(exc).lower() or "sha" in str(exc).lower():
+            info = api(path + f"?ref={CHAT_BRANCH}", allow_fail=True)
+            if info:
+                try:
+                    fields["sha"] = json.loads(info)["sha"]
+                except Exception:
+                    pass
+                api(path, "PUT", fields)
+                return
+        raise
 
 
 def publish_file(path: Path, name: str | None = None) -> str:
@@ -433,11 +501,14 @@ def selftest() -> int:
         results.append(("канал chat: запись/чтение", bool(got and got.get("text") == "selftest"), f"seq {seq}"))
     except Exception as exc:
         results.append(("канал chat", False, str(exc)))
-    try:
-        shot = screenshot()
-        results.append(("скриншот", shot.exists(), f"{shot.stat().st_size // 1024} KB"))
-    except Exception as exc:
-        results.append(("скриншот", False, str(exc)))
+    if os.name == "nt":
+        try:
+            shot = screenshot()
+            results.append(("скриншот", shot.exists(), f"{shot.stat().st_size // 1024} KB"))
+        except Exception as exc:
+            results.append(("скриншот", False, str(exc)))
+    else:
+        results.append(("скриншот", True, "только Windows — пропущено"))
     failed = 0
     for name, ok, detail in results:
         if not ok:
@@ -452,6 +523,8 @@ def main() -> int:
         return selftest()
 
     refresh_path()
+    if os.environ.get("ARENA_NO_UPDATE") != "1":
+        auto_update()
     if not shutil.which("gh") and not install_gh():
         return 2
 
