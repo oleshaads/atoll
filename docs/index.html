@@ -27,6 +27,7 @@
   .agent{align-self:flex-start;background:var(--panel)}
   .sys{align-self:center;border:none;background:transparent;color:var(--dim);font-size:12px}
   .m .t{font-size:11px;opacity:.6;margin-bottom:4px}
+  .m a{color:#58a6ff}
   .m code{background:rgba(110,118,129,.25);padding:1px 5px;border-radius:4px;font-size:13px}
   .m pre{background:#0b0f14;border:1px solid var(--line);padding:10px;border-radius:8px;
          overflow-x:auto;margin:6px 0;font-size:13px}
@@ -46,7 +47,7 @@
          justify-content:center;padding:20px;z-index:9}
   #setup.show{display:flex}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px;
-        max-width:560px;width:100%;max-height:90vh;overflow:auto}
+        max-width:580px;width:100%;max-height:90vh;overflow:auto}
   .card h2{margin:0 0 6px;font-size:17px}
   .card p{color:var(--dim);font-size:13px;margin:8px 0}
   .card a{color:#58a6ff}
@@ -59,6 +60,7 @@
   ol{padding-left:18px;font-size:13px;color:var(--dim);margin:8px 0}
   ol li{margin:5px 0}
   code.k{background:rgba(110,118,129,.25);padding:1px 5px;border-radius:4px;font-size:12px}
+  .pend{opacity:.65}
 </style>
 </head>
 <body>
@@ -80,14 +82,12 @@
 <div id="setup">
   <div class="card">
     <h2>Подключение к репозиторию</h2>
-    <p>Нужен токен GitHub с доступом к репозиторию <code class="k" id="repoName">oleshaads/atoll</code>.
-       Хранится только в этом браузере (localStorage) и никуда больше не уходит.</p>
+    <p>Нужен токен GitHub с правами на <code class="k" id="repoName">oleshaads/atoll</code>.
+       Хранится только в этом браузере (localStorage).</p>
     <ol>
-      <li>Открой <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer">создание fine-grained токена</a></li>
+      <li>Открой <a id="newToken" href="#" target="_blank" rel="noreferrer">создание токена</a></li>
       <li><b>Repository access</b> → Only select repositories → <code class="k">atoll</code></li>
       <li><b>Permissions</b> → Contents: <b>Read and write</b></li>
-      <li>Срок действия — любой, например 90 дней</li>
-      <li><b>Contents</b> должен быть <b>Read and write</b>, иначе отправка вернёт ошибку 403</li>
       <li>Generate token и вставь сюда</li>
     </ol>
     <input id="tokenInput" type="password" placeholder="github_pat_… или ghp_…" autocomplete="off">
@@ -104,41 +104,53 @@ const OWNER_REPO = 'oleshaads/atoll';
 const API = 'https://api.github.com';
 const BRANCH = 'chat';
 const POLL_MS = 3000;
+const STORE_TOKEN = 'gh_token_v2';
+const STORE_LAST = 'last_name_v2';
 
 const el = id => document.getElementById(id);
 const log = el('log'), stateEl = el('state'), dot = el('dot'), banner = el('banner');
 const input = el('i'), sendBtn = el('b');
 
-let token = localStorage.getItem('gh_token') || '';
-let lastSeq = Number(localStorage.getItem('last_seq') || 0);
-let seqs = [];
+let token = localStorage.getItem(STORE_TOKEN) || '';
+let lastName = localStorage.getItem(STORE_LAST) || '';
 const rendered = new Set();
-let alive = true;
+let polling = false;
 
 function showBanner(text, kind){ banner.className = kind || 'err'; banner.textContent = text; }
 function hideBanner(){ banner.className = ''; banner.textContent = ''; }
 
-function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 function fmt(s){
   let h = esc(s);
   h = h.replace(/```([\s\S]*?)```/g, (m,c) => '<pre>' + c + '</pre>');
   h = h.replace(/`([^`]+)`/g, '<code>$1</code>');
   h = h.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
+  h = h.replace(/(https?:\/\/[^\s<)]+)/g, '<a href="$1" target="_blank" rel="noreferrer">$1</a>');
   return h;
 }
 
-function addMessage(seq, payload){
-  if (rendered.has(seq)) return;
-  rendered.add(seq);
+function addMessage(name, payload, pending){
+  if (rendered.has(name)) return;
+  rendered.add(name);
   const d = document.createElement('div');
   const from = payload.from || 'system';
-  d.className = 'm ' + (from === 'user' ? 'me' : from === 'agent' ? 'agent' : 'sys');
+  d.className = 'm ' + (from === 'user' ? 'me' : from === 'agent' ? 'agent' : 'sys') + (pending ? ' pend' : '');
+  d.id = 'msg-' + name.replace(/[^\w-]/g, '_');
   const who = from === 'user' ? 'ты' : from === 'agent' ? 'агент' : '';
   const tm = (payload.ts || '').slice(11,16);
-  d.innerHTML = (who ? '<div class="t">' + who + ' · ' + tm + '</div>' : '') + fmt(payload.text || '');
-  const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 140;
+  d.innerHTML = (who ? '<div class="t">' + who + ' · ' + tm + (pending ? ' · отправляется' : '') + '</div>' : '') + fmt(payload.text || '');
+  const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 160;
   log.appendChild(d);
   if (nearBottom || from === 'agent') log.scrollTop = log.scrollHeight;
+}
+
+function markFailed(name){
+  const node = document.getElementById('msg-' + name.replace(/[^\w-]/g, '_'));
+  if (!node) return;
+  node.classList.remove('pend');
+  const t = node.querySelector('.t');
+  if (t) t.textContent = t.textContent.replace(' · отправляется', ' · не отправлено');
+  node.style.borderColor = '#da3633';
 }
 
 async function gh(path, opts = {}){
@@ -154,79 +166,84 @@ async function gh(path, opts = {}){
   if (!res.ok){
     let detail = '';
     try { detail = (await res.json()).message || ''; } catch(e){}
-    throw new Error('HTTP ' + res.status + (detail ? ': ' + detail : ''));
+    const err = new Error('HTTP ' + res.status + (detail ? ': ' + detail : ''));
+    err.status = res.status;
+    throw err;
   }
   return res.status === 204 ? null : res.json();
 }
 
-async function whoAmI(){ return gh('/user'); }
-
-function b64encodeUtf8(str){
+const b64encodeUtf8 = str => {
   const bytes = new TextEncoder().encode(str);
   let bin = '';
   bytes.forEach(b => bin += String.fromCharCode(b));
   return btoa(bin);
-}
-function b64decodeUtf8(b64){
-  const bin = atob(b64.replace(/\s/g, ''));
-  const bytes = Uint8Array.from(bin, ch => ch.charCodeAt(0));
-  return new TextDecoder().decode(bytes);
+};
+
+function newName(role){
+  const d = new Date();
+  const p = n => String(n).padStart(2, '0');
+  const ts = `${d.getUTCFullYear()}${p(d.getUTCMonth()+1)}${p(d.getUTCDate())}T${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}`;
+  const rnd = Math.random().toString(36).slice(2, 8);
+  return `${ts}-${role}-${rnd}.json`;
 }
 
 async function listChat(){
-  try {
-    const items = await gh('/repos/' + OWNER_REPO + '/contents/chat?ref=' + BRANCH);
-    seqs = (items || [])
-      .map(it => (it.name.match(/^(\d+)\.json$/) || [])[1])
-      .filter(Boolean).map(Number).sort((a,b) => a-b);
-    return seqs;
-  } catch(e){
-    throw e;
-  }
+  const items = await gh('/repos/' + OWNER_REPO + '/contents/chat?ref=' + BRANCH);
+  return (items || []).map(it => it.name).filter(n => n.endsWith('.json')).sort();
 }
 
-async function readChat(seq){
-  const path = '/repos/' + OWNER_REPO + '/contents/chat/' + String(seq).padStart(6,'0') + '.json?ref=' + BRANCH;
-  const res = await fetch(API + path, {
+async function readChat(name){
+  const res = await fetch(API + '/repos/' + OWNER_REPO + '/contents/chat/' + encodeURIComponent(name) + '?ref=' + BRANCH, {
     headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github.raw' }
   });
   if (!res.ok) return null;
   try { return JSON.parse(await res.text()); } catch(e){ return null; }
 }
 
-async function writeChat(seq, payload){
-  const path = '/repos/' + OWNER_REPO + '/contents/chat/' + String(seq).padStart(6,'0') + '.json';
+async function writeChat(name, payload, attempt = 1){
   const body = {
-    message: 'chat ' + String(seq).padStart(6,'0') + ' (' + (payload.from || 'user') + ')',
+    message: 'chat ' + name + ' (' + (payload.from || 'user') + ')',
     content: b64encodeUtf8(JSON.stringify(payload)),
     branch: BRANCH
   };
   try {
-    const existing = await gh(path + '?ref=' + BRANCH);
-    if (existing && existing.sha) body.sha = existing.sha;
-  } catch(e){ /* файла нет — это нормально */ }
-  return gh(path, { method: 'PUT', body: JSON.stringify(body) });
+    return await gh('/repos/' + OWNER_REPO + '/contents/chat/' + encodeURIComponent(name), {
+      method: 'PUT', body: JSON.stringify(body)
+    });
+  } catch(e){
+    // 409 — имя занято, 422 — уже существует: берём новое имя и пробуем снова
+    if ((e.status === 409 || e.status === 422) && attempt < 5){
+      const fresh = newName(payload.from || 'user');
+      return writeChat(fresh, payload, attempt + 1);
+    }
+    throw e;
+  }
 }
 
 async function poll(){
-  if (!token || !alive) return;
+  if (!token || polling || !navigator.onLine) { setTimeout(poll, POLL_MS); return; }
+  polling = true;
   try {
-    const list = await listChat();
-    const fresh = list.filter(s => s > lastSeq);
-    for (const s of fresh){
-      const payload = await readChat(s);
-      if (payload) addMessage(s, payload);
-      lastSeq = Math.max(lastSeq, s);
+    const names = await listChat();
+    const fresh = names.filter(n => n > lastName);
+    for (const name of fresh.slice(-40)){
+      const payload = await readChat(name);
+      if (payload) addMessage(name, payload);
     }
-    localStorage.setItem('last_seq', String(lastSeq));
+    if (names.length){
+      lastName = names[names.length - 1];
+      localStorage.setItem(STORE_LAST, lastName);
+    }
     dot.className = 'dot on';
-    stateEl.textContent = (list.length || 0) + ' сообщений · онлайн';
+    stateEl.textContent = names.length + ' сообщений · онлайн';
     if (banner.classList.contains('err')) hideBanner();
   } catch(e){
     dot.className = 'dot off';
     stateEl.textContent = 'нет связи с GitHub';
     showBanner('GitHub недоступен: ' + e.message, 'err');
   } finally {
+    polling = false;
     setTimeout(poll, POLL_MS);
   }
 }
@@ -235,26 +252,25 @@ async function connect(withToken){
   token = withToken || token;
   if (!token){ toggleSetup(true); return; }
   try {
-    const me = await whoAmI();
-    localStorage.setItem('gh_token', token);
+    const me = await gh('/user');
+    localStorage.setItem(STORE_TOKEN, token);
     toggleSetup(false);
     hideBanner();
     dot.className = 'dot on';
     stateEl.textContent = 'подключено как ' + me.login;
-    const list = await listChat();
-    const tail = list.slice(-15);
-    for (const s of tail){
-      const payload = await readChat(s);
-      if (payload) addMessage(s, payload);
+    const names = await listChat();
+    for (const name of names.slice(-15)){
+      const payload = await readChat(name);
+      if (payload) addMessage(name, payload);
     }
-    lastSeq = list.length ? Math.max(...list) : 0;
-    localStorage.setItem('last_seq', String(lastSeq));
+    lastName = names.length ? names[names.length - 1] : '';
+    localStorage.setItem(STORE_LAST, lastName);
     poll();
   } catch(e){
     token = '';
-    localStorage.removeItem('gh_token');
+    localStorage.removeItem(STORE_TOKEN);
     dot.className = 'dot off';
-    showBanner('Не удалось подключиться: ' + e.message + '\nПроверь, что токен даёт доступ к ' + OWNER_REPO + ' и права Contents: Read and write.', 'err');
+    showBanner('Не удалось подключиться: ' + e.message + '\nПроверь доступ к ' + OWNER_REPO + ' и права Contents: Read and write.', 'err');
     toggleSetup(true);
   }
 }
@@ -266,42 +282,42 @@ function toggleSetup(open){
 
 el('gear').onclick = () => toggleSetup(!el('setup').classList.contains('show'));
 el('closeSetup').onclick = () => toggleSetup(false);
-el('saveToken').onclick = async () => {
+el('saveToken').onclick = () => {
   const value = el('tokenInput').value.trim();
   if (!value){ el('tokenErr').textContent = 'Вставь токен'; return; }
   el('tokenErr').textContent = '';
-  await connect(value);
+  connect(value);
 };
 
 el('f').addEventListener('submit', async (e) => {
   e.preventDefault();
   const text = input.value.trim();
   if (!text) return;
-  if (!token){ showBanner('Сначала подключись: кнопка «настройки» справа сверху.', 'info'); toggleSetup(true); return; }
+  if (!token){ showBanner('Сначала подключись: «настройки» справа сверху.', 'info'); toggleSetup(true); return; }
+
+  const name = newName('user');
+  const payload = { from: 'user', text, ts: new Date().toISOString().slice(0,19) };
+  addMessage(name, payload, true);
+  lastName = name;
+  localStorage.setItem(STORE_LAST, name);
+  input.value = ''; input.style.height = '46px';
   sendBtn.disabled = true; sendBtn.textContent = '…';
+
   try {
-    const list = await listChat();
-    const next = (list.length ? Math.max(...list) : 0) + 1;
-    const payload = { from: 'user', text, ts: new Date().toISOString().slice(0,19) };
-    addMessage(next, payload);
-    lastSeq = Math.max(lastSeq, next);
-    localStorage.setItem('last_seq', String(lastSeq));
-    input.value = ''; input.style.height = '46px';
-    await writeChat(next, payload);
-    await poll();
+    await writeChat(name, payload);
+    const node = document.getElementById('msg-' + name.replace(/[^\w-]/g, '_'));
+    if (node){
+      node.classList.remove('pend');
+      const t = node.querySelector('.t');
+      if (t) t.textContent = t.textContent.replace(' · отправляется', '');
+    }
+    hideBanner();
   } catch(err){
-    const msg = String(err.message || err);
-    if (msg.includes('403')){
-      showBanner(
-        'Токен не может писать в репозиторий (403).\n\n' +
-        'Что сделать: открой токен и дай право Contents: Read and write —\n' +
-        'https://github.com/settings/personal-access-tokens\n\n' +
-        'Либо создай новый токен по этой ссылке:\n' +
-        'https://github.com/settings/personal-access-tokens/new?name=atoll-chat&target_name=oleshaads\n' +
-        'Repository access → Only select repositories → atoll\n' +
-        'Permissions → Contents → Read and write', 'err');
+    markFailed(name);
+    if (err.status === 403){
+      showBanner('Токену не хватает права на запись.\nОткрой токен и включи Contents: Read and write:\nhttps://github.com/settings/personal-access-tokens', 'err');
     } else {
-      showBanner('Не отправлено: ' + msg, 'err');
+      showBanner('Не отправлено: ' + err.message, 'err');
     }
   } finally {
     sendBtn.disabled = false; sendBtn.textContent = 'отправить'; input.focus();
@@ -317,6 +333,7 @@ input.addEventListener('input', () => {
 });
 
 el('repoName').textContent = OWNER_REPO;
+el('newToken').href = 'https://github.com/settings/personal-access-tokens/new?name=atoll-chat&target_name=oleshaads';
 if (token) connect(token); else toggleSetup(true);
 </script>
 </body>
