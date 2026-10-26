@@ -1,0 +1,41 @@
+name: agent-bridge
+run-name: "${{ inputs.cmd }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      cmd:
+        description: "Команда PowerShell"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: agent-bridge
+  cancel-in-progress: false
+
+jobs:
+  exec:
+    # Задачу может запускать только владелец репозитория.
+    if: github.actor == github.repository_owner
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 20
+    steps:
+      - name: Run
+        shell: powershell
+        env:
+          CMD: ${{ inputs.cmd }}
+        run: |
+          Write-Output ">>> $env:CMD"
+          Write-Output "host: $env:COMPUTERNAME | user: $env:USERNAME | cwd: $(Get-Location)"
+          Invoke-Expression $env:CMD *>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\out.txt"
+
+      - name: Save output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: out
+          path: ${{ runner.temp }}/out.txt
+          if-no-files-found: ignore
+          retention-days: 3
