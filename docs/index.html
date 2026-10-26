@@ -215,7 +215,7 @@ async function poll(){
     const fresh = list.filter(s => s > lastSeq);
     for (const s of fresh){
       const payload = await readChat(s);
-      if (payload && payload.from !== 'user') addMessage(s, payload);
+      if (payload) addMessage(s, payload);
       lastSeq = Math.max(lastSeq, s);
     }
     localStorage.setItem('last_seq', String(lastSeq));
@@ -282,8 +282,12 @@ el('f').addEventListener('submit', async (e) => {
   try {
     const list = await listChat();
     const next = (list.length ? Math.max(...list) : 0) + 1;
-    await writeChat(next, { from: 'user', text, ts: new Date().toISOString().slice(0,19) });
+    const payload = { from: 'user', text, ts: new Date().toISOString().slice(0,19) };
+    addMessage(next, payload);
+    lastSeq = Math.max(lastSeq, next);
+    localStorage.setItem('last_seq', String(lastSeq));
     input.value = ''; input.style.height = '46px';
+    await writeChat(next, payload);
     await poll();
   } catch(err){
     const msg = String(err.message || err);
