@@ -251,7 +251,7 @@ def load_state() -> dict:
             return json.loads(STATE_PATH.read_text(encoding="utf-8"))
         except Exception:
             pass
-    return {"last_agent_seq": 0, "last_user_seq": 0}
+    return {"last_agent_name": "", "last_user_name": ""}
 
 
 def save_state(state: dict) -> None:
@@ -278,7 +278,14 @@ def ensure_chat_branch() -> None:
     )
 
 
-def list_chat() -> list[int]:
+def new_name(role: str = "user") -> str:
+    """Уникальное имя файла: время + случайный суффикс. Конфликтов не бывает."""
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    tail = "".join(__import__("random").choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(6))
+    return f"{stamp}-{role}-{tail}.json"
+
+
+def list_chat() -> list[str]:
     raw = api(f"repos/{REPO}/contents/chat?ref={CHAT_BRANCH}", allow_fail=True)
     if not raw:
         return []
@@ -286,16 +293,12 @@ def list_chat() -> list[int]:
         items = json.loads(raw)
     except json.JSONDecodeError:
         return []
-    seqs = []
-    for item in items if isinstance(items, list) else []:
-        match = re.match(r"^(\d+)\.json$", item.get("name", ""))
-        if match:
-            seqs.append(int(match.group(1)))
-    return sorted(seqs)
+    names = [i.get("name", "") for i in items] if isinstance(items, list) else []
+    return sorted(n for n in names if n.endswith(".json"))
 
 
-def read_chat(seq: int) -> dict | None:
-    raw = api(f"repos/{REPO}/contents/chat/{seq:06d}.json?ref={CHAT_BRANCH}", raw=True, allow_fail=True)
+def read_chat(name: str) -> dict | None:
+    raw = api(f"repos/{REPO}/contents/chat/{name}?ref={CHAT_BRANCH}", raw=True, allow_fail=True)
     if not raw:
         return None
     try:
@@ -304,31 +307,19 @@ def read_chat(seq: int) -> dict | None:
         return None
 
 
-def write_chat(seq: int, payload: dict) -> None:
+def write_chat(payload: dict, name: str | None = None) -> str:
+    name = name or new_name(payload.get("from", "user"))
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    content_b64 = base64.b64encode(body).decode("ascii")
-    path = f"repos/{REPO}/contents/chat/{seq:06d}.json"
-    fields = {"message": f"chat {seq:06d} ({payload.get('from')})", "content": content_b64, "branch": CHAT_BRANCH}
-    # если файл уже существует — GitHub требует sha
-    existing = api(path + f"?ref={CHAT_BRANCH}", allow_fail=True)
-    if existing:
-        try:
-            fields["sha"] = json.loads(existing)["sha"]
-        except Exception:
-            pass
-    try:
-        api(path, "PUT", fields)
-    except GhError as exc:
-        if "already exists" in str(exc).lower() or "sha" in str(exc).lower():
-            info = api(path + f"?ref={CHAT_BRANCH}", allow_fail=True)
-            if info:
-                try:
-                    fields["sha"] = json.loads(info)["sha"]
-                except Exception:
-                    pass
-                api(path, "PUT", fields)
-                return
-        raise
+    api(
+        f"repos/{REPO}/contents/chat/{name}",
+        "PUT",
+        {
+            "message": f"chat {name} ({payload.get('from')})",
+            "content": base64.b64encode(body).decode("ascii"),
+            "branch": CHAT_BRANCH,
+        },
+    )
+    return name
 
 
 def publish_file(path: Path, name: str | None = None) -> str:
@@ -445,10 +436,10 @@ def poller(state: dict, stop: threading.Event) -> None:
         if stop.is_set():
             break
         try:
-            seqs = [s for s in list_chat() if s > state.get("last_agent_seq", 0)]
-            for seq in seqs:
-                payload = read_chat(seq)
-                state["last_agent_seq"] = max(state.get("last_agent_seq", 0), seq)
+            names = [n for n in list_chat() if n > state.get("last_agent_name", "")]
+            for name in names:
+                payload = read_chat(name)
+                state["last_agent_name"] = name
                 if not payload or payload.get("from") == "user":
                     continue
                 show_message(payload)
@@ -465,7 +456,7 @@ def status(state: dict) -> None:
         run = None
     lines = [
         f"репозиторий: {REPO}",
-        f"канал: ветка {CHAT_BRANCH}, последнее сообщение: {state.get('last_agent_seq', 0)}",
+        f"канал: ветка {CHAT_BRANCH}, последнее сообщение: {state.get('last_agent_name', '-')}",
         f"файлы: ветка {OUT_BRANCH}",
     ]
     if run:
@@ -494,11 +485,9 @@ def selftest() -> int:
         return 1
     try:
         ensure_chat_branch()
-        before = list_chat()
-        seq = (max(before) if before else 0) + 1
-        write_chat(seq, {"from": "user", "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "text": "selftest"})
-        got = read_chat(seq)
-        results.append(("канал chat: запись/чтение", bool(got and got.get("text") == "selftest"), f"seq {seq}"))
+        name = write_chat({"from": "user", "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "text": "selftest"})
+        got = read_chat(name)
+        results.append(("канал chat: запись/чтение", bool(got and got.get("text") == "selftest"), name))
     except Exception as exc:
         results.append(("канал chat", False, str(exc)))
     if os.name == "nt":
@@ -545,20 +534,19 @@ def main() -> int:
     state = load_state()
     try:
         ensure_chat_branch()
-        seqs = list_chat()
+        names = list_chat()
     except GhError as exc:
         say(Panel(Text(str(exc), style="red"), border_style="red", title="канал недоступен"))
         return 2
 
-    banner(login, seqs[-1] if seqs else 0)
-    if seqs:
-        recent = [s for s in seqs if s >= max(1, seqs[-1] - 8)]
+    banner(login, len(names))
+    if names:
         say(Text("--- последние сообщения ---", style="dim"))
-        for s in recent:
-            payload = read_chat(s)
+        for name in names[-12:]:
+            payload = read_chat(name)
             if payload:
                 show_message(payload)
-        state["last_agent_seq"] = seqs[-1]
+        state["last_agent_name"] = names[-1]
         save_state(state)
 
     stop = threading.Event()
@@ -584,9 +572,9 @@ def main() -> int:
                 continue
             if line == "/sync":
                 try:
-                    for s in [x for x in list_chat() if x > state.get("last_agent_seq", 0)]:
-                        payload = read_chat(s)
-                        state["last_agent_seq"] = s
+                    for name in [x for x in list_chat() if x > state.get("last_agent_name", "")]:
+                        payload = read_chat(name)
+                        state["last_agent_name"] = name
                         if payload:
                             show_message(payload)
                     save_state(state)
@@ -629,9 +617,8 @@ def main() -> int:
                 continue
 
             try:
-                seq = (max(list_chat()) if list_chat() else 0) + 1
-                write_chat(seq, {"from": "user", "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "text": line})
-                state["last_user_seq"] = seq
+                name = write_chat({"from": "user", "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "text": line})
+                state["last_user_name"] = name
                 save_state(state)
                 say(Text("  отправлено · напиши «проверь» в чате Arena, чтобы получить ответ", style="dim"))
             except Exception as exc:
